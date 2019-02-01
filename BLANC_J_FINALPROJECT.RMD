@@ -1,0 +1,266 @@
+---
+title: "Music Chart Analysis"
+output:
+  html_document:
+    df_print: paged
+---
+
+In this project, I analyze trends in the Billboard Hot 100 music charts over the last 61 years, and integrate data from Spotify's API to make predictions about songs on the charts. 
+
+SPOTIFY API
+In this chunk, I create three functions which I use throughout my code to make calls to Spotify's API. The first, spotifyAPI(), takes in a URL meant to be an "endpoint" in Spotify's API, which will return data in a JSON format. The second, getTrackIDFromQuery(), takes in a character query and searches for it through Spotify's API, then returns the first track ID found in the results. I use this to get the spotify track IDs of songs on the Billboard charts by entering the track title and the artist's name as query parameters. The final function takes a spotify track id and returns a JSON containing data describing the audio features of that track. This includes many descriptors of the content of the track itself. More can be found at https://developer.spotify.com/console/get-audio-features-track/. 
+```{r}
+library(jsonlite)
+library(httr)
+library(dplyr)
+library(rvest)
+
+clientID <- "f37c56713eee4eb390b4fa3d0b963ffd"
+secret <- "3488df63939040ff8d4715a694c60fbd"
+
+accessToken <- content(POST(
+  "https://accounts.spotify.com/api/token",
+  accept_json(),
+  authenticate(clientID, secret),
+  body = list(grant_type = "client_credentials"),
+  encode = "form",
+  verbose()
+))$access_token
+
+authentication <- paste0("Bearer ", accessToken)
+
+spotifyAPI <- function(URL) {
+  return(GET(url = URL, add_headers(Authorization = authentication)))
+}
+
+getTrackIDFromQuery <- function(query) {
+  return(fromJSON(content(spotifyAPI(paste0("https://api.spotify.com/v1/search?q=", mgsub(pattern = " ", replacement = "%20", x = query), "&type=track")), "text"))[["tracks"]][["items"]][["id"]][1])
+}
+
+getAudioFeatures <- function(trackID) {
+  if (is.na(trackID)) {
+    return(NA)
+  } 
+  out <- fromJSON(content(spotifyAPI(paste0("https://api.spotify.com/v1/audio-features/", trackID)), "text"))
+  if (out[[1]][[1]] == 404) {
+    return(NA)
+  }
+  return(out)
+}
+```
+
+WEB SCRAPING TOOL
+This chunk is a helper function for scraping Billboard's website. It takes in the output of rvest::read_html(url) and correctly parses the nodes to extract the track title, track artist, and ranking for the week. I use my spotify method getTrackIDFromQuery to link the spotify track ID to each track. I then return the newly-created data frame. 
+```{r}
+library(textclean)
+extractData <- function(webpage) {
+  newDF <- data.frame(track_title = character(), track_artist = character(), track_rank = numeric())
+  newDF <- rbind(newDF, data.frame(
+    mgsub(pattern = c("\"", "\n", "`", "%"), replacement = "", x = as.character(html_text(html_nodes(webpage, ".chart-list-item__title-text , .chart-number-one__title")))), 
+    mgsub(pattern = c("\"", "\n", "`", "%"), replacement = "", x = as.character(html_text(html_nodes(webpage, ".chart-number-one__artist , .chart-list-item__artist")))), 
+    as.numeric(mgsub(pattern = c("\"", "\n", "`", "%"), replacement = "", x = as.numeric(html_text(html_nodes(webpage, ".chart-list-item__rank , .chart-number-one__rank img")))))
+    ))
+  names(newDF) <- c("track_title", "track_artist", "track_rank")
+  newDF$track_rank[1] <- 1
+  
+  i <- 1
+  spotifyTrackID <- c()
+  for (i in 1:nrow(newDF)) {
+    newID <- getTrackIDFromQuery(paste(newDF$track_title[i], newDF$track_artist[i]))
+    if (is.null(newID)) {
+      newID <- NA
+    }
+    spotifyTrackID <- c(spotifyTrackID, newID)
+  }
+  
+  newDF <- cbind(newDF, spotifyTrackID)
+  return(newDF)
+}
+```
+
+Web Scraping Billboard
+First, I create a vector of all dates from the first Hot 100 chart until today, separated by a year. 
+Each Hot 100 chart can be found at the rootURL + a date. I call read_html on each combination of the root and dates, and bind each result to a single data frame. I also attatch the date to each record. 
+```{r}
+dateVector <- seq(as.Date("1958-08-04"), as.Date("2018-12-08"), "1 year")
+
+rootURL <- "https://www.billboard.com/charts/hot-100/"
+
+i <- 1
+billboardData <- extractData(read_html(paste0(rootURL, dateVector[i]))) 
+billboardData <- cbind(billboardData, rep(x = dateVector[i], times = 100))
+for (i in 2:61) {
+  newData <- extractData(read_html(paste0(rootURL, dateVector[i])))
+  newData <- cbind(newData, rep(x = dateVector[i], times = 100))
+  billboardData <- rbind(billboardData, newData)
+}
+colnames(billboardData)[5] <- "chart_date"
+```
+
+Creating Audiofeatures Dataframe
+From the data frame created above, I create a second data frame by compiling the audio features of each track with my helper getAudioFeatures, using the Spotify track IDs found earlier. Some tracks that are represented in the BillboardData df are not represented here, because not every song on the Billboard Hot 100 charts is on spotify, and therefore I cannot get the audio features for every single track. 
+```{r}
+i <- 1
+audiofeatures <- data.frame(getAudioFeatures(billboardData$spotifyTrackID[i]), stringsAsFactors = FALSE)
+for (i in 2:nrow(billboardData)) {
+  newData <- getAudioFeatures(billboardData$spotifyTrackID[i])
+  if (!is.na(newData))  {
+    code <- newData[[1]][[1]][[1]]
+    
+    if (length(code)) {
+      if (code == 429) {
+        Sys.sleep(10)
+        newData <- getAudioFeatures(billboardData$spotifyTrackID[i])
+      }
+    }
+    
+    audiofeatures <- rbind(audiofeatures, newData)
+  }
+}
+```
+
+Here, I plot the distribution of each of the audio features given by the spotify API for each track. I remove outliers from the data by removing entire tracks that have an outlier in one of these variables, because there is enough data to do so. 
+```{r}
+library(ggplot2)
+ggplot(data = audiofeatures, aes(audiofeatures$loudness)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$danceability)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$energy)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$key)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$loudness)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$mode)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$speechiness)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$acousticness)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$instrumentalness)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$liveness)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$valence)) + geom_histogram()
+ggplot(data = audiofeatures, aes(audiofeatures$tempo)) + geom_histogram()
+
+outliers <- function(col) {
+  zscores <- scale(col)
+  for (i in 1:length(col)) {
+    if (abs(zscores[i]) > 3) {
+      col[i] <- NA
+    }
+  }
+  return(col)
+}
+
+audiofeatures$danceability <- outliers(audiofeatures$danceability)
+audiofeatures$energy <- outliers(audiofeatures$energy)
+audiofeatures$key <- outliers(audiofeatures$key)
+audiofeatures$loudness <- outliers(audiofeatures$loudness)
+audiofeatures$mode <- outliers(audiofeatures$mode)
+audiofeatures$speechiness <- outliers(audiofeatures$speechiness)
+audiofeatures$acousticness <- outliers(audiofeatures$acousticness)
+audiofeatures$instrumentalness <- outliers(audiofeatures$instrumentalness)
+audiofeatures$liveness <- outliers(audiofeatures$liveness)
+audiofeatures$valence <- outliers(audiofeatures$valence)
+
+audiofeatures <- audiofeatures[complete.cases(audiofeatures),]
+```
+
+DATA STORAGE & RETRIEVAL
+After removing outliers, write the two data frames that I created above to two tables in a SQL database. I call the two select * queries to ensure that the data was properly inserted into a table. Each table has the spotifyTrackId for each track, so I am able to join the tables together on this value. I use the sql MIN function to find the peak rank of each track on the charts in the data, and return that value along with the combination of all variables from both tables. 
+```{r}
+library("RSQLite")
+
+database <- dbConnect(SQLite(), dbname = "db.sqlite")
+
+dbWriteTable(database, "audiofeatures", audiofeatures, overwrite = TRUE)
+billboardData$chart_date <- as.character(billboardData$chart_date)
+dbWriteTable(database, "billboard", billboardData, overwrite = TRUE)
+
+dbGetQuery(database, statement = "SELECT * FROM audiofeatures")
+dbGetQuery(database, statement = "SELECT * FROM billboard")
+
+data <- dbGetQuery(database, "SELECT MIN(billboard.track_rank) as peak_rank, * FROM audiofeatures LEFT JOIN billboard ON billboard.spotifyTrackID = audiofeatures.id GROUP BY billboard.spotifyTrackID")
+```
+
+Here, I plot the data I retreive from my database above. This allows me to see correlations between the two different tables and how the data changes over time. I plot each of the audio features against the dates of the songs feature on the Billboard charts, which allows me to visualize changes in these features over the last 60 years. In general, these graphs show that music is getting louder, more danceable, more energetic, and less acoustic. 
+```{r}
+ggplot(data = data, aes(x = as.Date(chart_date), y = loudness)) + geom_point() + geom_smooth()
+ggplot(data = data, aes(x = as.Date(chart_date), y = instrumentalness)) + geom_point() + geom_smooth()
+ggplot(data = data, aes(x = as.Date(chart_date), y = valence)) + geom_point() + geom_smooth()
+ggplot(data = data, aes(x = as.Date(chart_date), y = liveness)) + geom_point() + geom_smooth()
+ggplot(data = data, aes(x = as.Date(chart_date), y = acousticness)) + geom_point() + geom_smooth()
+ggplot(data = data, aes(x = as.Date(chart_date), y = speechiness)) + geom_point() + geom_smooth()
+ggplot(data = data, aes(x = as.Date(chart_date), y = energy)) + geom_point() + geom_smooth()
+ggplot(data = data, aes(x = as.Date(chart_date), y = danceability)) + geom_point() + geom_smooth()
+```
+
+MODEL CONSTRUCTION AND EVALUATION
+First, I split the data into training and testing sets. Then, I create a multiple linear regression model with each of the ten audio features included in the formula for determining a track's peak rank. I then use the step function to step backward through the variables and determine the ideal model for determining peak rank. Of the 10 original variables, valence, liveness, mode, danceability, and key are used in the ideal model. Finally, I use predict to predict values for the test set, and see if those values are within +- 1 of the actual values below. Overall, my model had a 3.55% success rate, showing that more information is needed to determine a song's peak rank than just some descriptors of the audio. 
+```{r}
+library(caTools)
+splitVector <- sample.split(data$track_title, SplitRatio = .7)
+train <- data[splitVector, ]
+test <- data[!splitVector, ]
+
+model <- lm(formula = peak_rank ~ danceability + energy + key + loudness + mode + speechiness + acousticness + instrumentalness + liveness + valence + tempo, data = train)
+
+ideal.model <- step(model, direction = "backward")
+
+test$peak_rank_prediction <- predict(ideal.model, newdata = test, type = "response")
+
+accurateCount <- 0
+for (i in 1:nrow(test)) {
+  if (round(test$peak_rank_prediction[i]) == test$peak_rank[i]
+      || round(test$peak_rank_prediction[i]) - 1 == test$peak_rank[i]
+      || round(test$peak_rank_prediction[i]) + 1 == test$peak_rank[i]) {
+    accurateCount <- accurateCount + 1
+  }
+}
+print(accurateCount/nrow(test))
+```
+
+
+Here, I construct a logistic regression model to try to predict the likelihood that a song breaks into the top 50 of the Billboard Hot 100. 
+```{r}
+splitVector2 <- sample.split(data$track_title, SplitRatio = .7)
+train2 <- data[splitVector2,]
+test2 <- data[!splitVector2,]
+
+top50 <- c()
+for (i in 1:nrow(train2)) {
+  if (train2$peak_rank[i] <= 50) {
+    top50 <- c(top50, TRUE)
+  } else {
+    top50 <- c(top50, FALSE)
+  }
+}
+train2$top50 <- top50
+
+top50Model <- glm(formula = top50 ~ danceability + energy + key + loudness + mode + speechiness + acousticness + instrumentalness + liveness + valence + tempo, family = "binomial", data = train2)
+optimal <- step(top50Model, direction = "backward")
+
+top50 <- c()
+for (i in 1:nrow(test2)) {
+  if (test2$peak_rank[i] <= 50) {
+    top50 <- c(top50, TRUE)
+  } else {
+    top50 <- c(top50, FALSE)
+  }
+}
+test2$top50 <- top50
+
+predictions <- predict(object = optimal, newdata = test2, type = "response")
+for (i in 1:length(predictions)) {
+  if (predictions[i] > .5) {
+    predictions[i] = TRUE
+  } else {
+    predictions[i] = FALSE
+  }
+}
+test2$top50predictions <- predictions
+
+
+accurate <- 0
+for (i in 1:nrow(test2)) {
+  if (test2$top50predictions[i] == test2$top50[i]) {
+    accurate <- accurate + 1
+  }
+}
+print(accurate/nrow(test2))
+```
+
+
